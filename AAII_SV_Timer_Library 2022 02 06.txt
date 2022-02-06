@@ -1,0 +1,854 @@
+#
+#       AAII_SV_Timer_Library
+#       Lloyd Mayhew
+#       Feb. 6, 2022   Version 01D
+#
+#       Program loads historical pricing data from Norgate and/or Yahoo
+#           Norgate doesn't have Mutual Funds
+#           Tiingo doesn't have VIX, must use Norgate $VIX
+#           Yahoo Data can be used to access intraday values
+#
+#       Program can be run during the trading day using Yahoo data. It retrieves the
+#       current Yahoo intraday value. End-of-day only data such as for mutual funds
+#       and ^IRX repeat the previous close when this happens.
+#
+#       Program also creates the synthetic 'TBILL' based on Yahoo's ^IRX and 
+#       %IRX from Norgate.
+#       Note that ^IRX dates don't align with SPY dates because of more Fed 
+#       holidays than NYSE holidays. The program repeats previous close when this occurs.
+#       
+#       Input:  Reads pricing data directly from Norgate, Yahoo website (no API key
+#               is needed) and Tiingo website (API key is required)
+#
+#       Notes:  All Price Arrays are synchronized with SPY's trading dates (From 1/29/1993)
+#
+#       Versions: 1C 2022 01 23  Added smaD210(SPY) - T024, T053
+#                                      smaG(6,6)M(SPY) - T043
+#                                      smaM8 - T051, T052
+#                 1D 2022 02 06 FX1111M - Changed max wgts from 10 to 20
+#                               Added function_Timer_Fx1111M_Lists, generalized 1,3,6,12 to any 4
+#
+import norgatedata
+import numpy as np
+import pandas as pd
+import pandas_datareader as pdr
+import matplotlib.pyplot as plt
+import math
+import datetime as dt
+from   datetime import datetime
+from   datetime import timedelta
+import pytz
+import csv
+
+#       **************************************************************************
+#           Function to Load the Norgate Data
+#
+#       Creates the '___Norgate_AdjClose.csv' & '___Norgate_AdjClose.csv' files
+#
+#       Returns:  df_adjClose DataFrame of Adjusted Closing Prices normally aligned with SPY
+#                 df_adjOpen DataFrame of Adjusted Opening Prices normally aligned with SPY
+#       Note:     If %IRX is present then it will calculate the synthetic TBILL
+#     
+#       **************************************************************************
+#
+def function_load_Norgate(start_date = dt.datetime(1993, 1, 29)):  
+
+    symbols_Norgate = ['SPY', 'QQQ', 'VTI', 'IWB', 'IWP', 'IWS', 'IJH', 'IWM', 'VNQ',
+                       'TLT', 'IEF', 'SHY',
+                       '$SPX', '%IRX']  # plus the synthetic TBILL - calculated from %IRX
+
+    priceadjust = norgatedata.StockPriceAdjustmentType.TOTALRETURN 
+    padding_setting = norgatedata.PaddingType.NONE 
+    timeseriesformat = 'pandas-dataframe'
+    
+    sym_SPY   = 'SPY'                   # SPY is used for the calendar index (From 1/29/1993) 
+    #       Load the SPY Adjusted Close & Open Prices 
+    df_SPY = norgatedata.price_timeseries(sym_SPY,
+        stock_price_adjustment_setting = priceadjust,
+        padding_setting = padding_setting,
+        start_date = start_date,
+        timeseriesformat=timeseriesformat,)     
+    df_adjClose = df_SPY['Close'].rename(sym_SPY)     #   Load the SPY 'Close' Prices
+    df_adjOpen  = df_SPY['Open'].rename(sym_SPY)      #   Load the SPY 'Open' Prices
+      
+    #   Load the DateKey        
+    df_dateKeys = pd.DataFrame(df_adjClose.index.year*10000 + df_adjClose.index.month*100 + df_adjClose.index.day, 
+        index = df_adjClose.index)    
+    df_adjClose = pd.concat([df_adjClose, df_dateKeys['Date'].rename('DateKey')], axis = 1)
+    df_adjOpen  = pd.concat([df_adjOpen,  df_dateKeys['Date'].rename('DateKey')], axis = 1) 
+    
+    #       Create Day-Of_Month - Last 5 days of month are -1, -2...
+    df_DayOfMth = pd.DataFrame(df_adjClose.index.day, index = df_adjClose.index)    
+    iSize = df_DayOfMth.shape[0]        
+    for i in range(5, iSize-1):
+        if df_DayOfMth['Date'].iloc[i] > df_DayOfMth['Date'].iloc[i+1]:
+            df_DayOfMth['Date'].iloc[i]   = -1
+            df_DayOfMth['Date'].iloc[i-1] = -2
+            df_DayOfMth['Date'].iloc[i-2] = -3
+            df_DayOfMth['Date'].iloc[i-3] = -4
+            df_DayOfMth['Date'].iloc[i-4] = -5          
+    df_adjClose = pd.concat([df_adjClose, df_DayOfMth['Date'].rename('DayOfMth')], axis = 1)
+    df_adjOpen  = pd.concat([df_adjOpen,  df_DayOfMth['Date'].rename('DayOfMth')], axis = 1)
+
+    #       Load the Adjusted Close and Open Prices 
+    for jSym in range(len(symbols_Norgate)):     
+        symbol = symbols_Norgate[jSym]
+        if symbol == sym_SPY:  continue     # We already loaded SPY as the 1st entry      
+        df = norgatedata.price_timeseries(symbols_Norgate[jSym],
+        stock_price_adjustment_setting = priceadjust,
+        padding_setting = padding_setting,
+        start_date = start_date,
+        timeseriesformat=timeseriesformat,) # Read the Norgate Data     
+        
+        dfDatesNew, dfAligned =  df_SPY.align(df, join='left', method='ffill')        
+        df_adjClose = pd.concat([df_adjClose, dfAligned['Close'].rename(symbol)], axis = 1)
+        df_adjOpen  = pd.concat([df_adjOpen, dfAligned['Open'].rename(symbol)], axis = 1)
+        
+    #   If %IRX, then create the synthetic TBILL
+    #   dailyReturn(i)= (1+^IRX(i)/100)^1/252 – 1
+    #   then compute ec(i) = ec(i-1)*(1+dailyReturn(i))
+        if symbol == '%IRX':
+            date_IRX = df.index[0]          # start date for %IRX   
+            dfDatesNew, dfAligned = df_SPY.align(df, join='left', method='ffill') 
+            dfAligned_IRX = dfAligned * 1.0 # The multiply by 1.0 forces the creation of a new array
+    
+            for istart in range(df_SPY.shape[0]):
+                if df_adjClose.index[istart] >= date_IRX: break # Advance to start of data  
+                
+            dfAligned_IRX['Close'].iloc[istart] = 10.0    # start with 1st value= 10.0
+            y_previous = 10.0
+            for i in range(istart+1,df_SPY.shape[0]):
+                x = dfAligned_IRX['Close'].iloc[i]           
+                dr_IRX = (x/100.0)/252.0    # assume 252 trading days in year
+                y = dfAligned_IRX['Close'].iloc[i-1] * (1+dr_IRX)               
+                dfAligned_IRX['Close'].iloc[i] = y 
+                dfAligned_IRX['Open'].iloc[i] = y_previous 
+                y_previous = y          # Use yesterday's 'Close' to estimate today's 'Open'               
+            df_adjClose = pd.concat([df_adjClose, dfAligned_IRX['Close'].rename('TBILL')], axis = 1)
+            df_adjOpen  = pd.concat([df_adjOpen,  dfAligned_IRX['Open'].rename('TBILL')], axis = 1)
+    
+    return (df_adjOpen, df_adjClose)
+
+#
+#       **************************************************************************
+#           Function to Load the Yahoo Data 
+#
+#       Returns:    df_adjClose DataFrame of Adjusted Closing Prices aligned with SPY
+#       Note:       If ^IRX is present then it will calculate the synthetic TBILL
+#     
+#       **************************************************************************
+#
+def function_load_Yahoo(start_date = dt.datetime(1993, 1, 29)):  
+    
+    symbols_Yahoo = ['SPY', 'QQQ', 'VTI', 'IWB', 'IWP', 'IWS', 'IJH', 'IWM', 'VNQ',
+                     'TLT', 'IEF', 'SHY',
+                       '^SPX', '^IRX']  # plus the synthetic TBILL - calculated from ^IRX
+   
+    sym_SPY   = 'SPY'                   # SPY is used for the calendar index (From 1/29/1993) 
+    #       Load the Adjusted Close Prices
+    df_SPY = pdr.get_data_yahoo(sym_SPY, start_date)     
+    df_adjClose = df_SPY['Adj Close'].rename(sym_SPY)
+      
+    #   Load the Date Key        
+    df_dateKeys = pd.DataFrame(df_adjClose.index.year*10000 + df_adjClose.index.month*100 + df_adjClose.index.day, 
+        index = df_adjClose.index)    
+    df_adjClose = pd.concat([df_adjClose, df_dateKeys['Date'].rename('DateKey')], axis = 1) 
+    
+     #       Create Day-Of_Month - Last 5 days of month are -1, -2...
+    df_DayOfMth = pd.DataFrame(df_adjClose.index.day, index = df_adjClose.index)    
+    iSize = df_DayOfMth.shape[0]        
+    for i in range(5, iSize-1):
+        if df_DayOfMth['Date'].iloc[i] > df_DayOfMth['Date'].iloc[i+1]:
+            df_DayOfMth['Date'].iloc[i]   = -1
+            df_DayOfMth['Date'].iloc[i-1] = -2
+            df_DayOfMth['Date'].iloc[i-2] = -3
+            df_DayOfMth['Date'].iloc[i-3] = -4
+            df_DayOfMth['Date'].iloc[i-4] = -5          
+    df_adjClose = pd.concat([df_adjClose, df_DayOfMth['Date'].rename('DayOfMth')], axis = 1)
+    
+    for jSym in range(len(symbols_Yahoo)):     
+        symbol = symbols_Yahoo[jSym]
+        if symbol == sym_SPY:  continue     # We already loaded SPY as the 1st entry
+    
+        df = pdr.get_data_yahoo(symbol, start_date) # Read the Yahoo Data         
+        dfDatesNew, dfAligned =  df_SPY.align(df, join='left', method='ffill')  
+        df_adjClose = pd.concat([df_adjClose, dfAligned['Adj Close'].rename(symbol)], axis = 1)
+        
+    #   If ^IRX, then create the synthetic TBILL
+    #   dailyReturn(i)= (1+^IRX(i)/100)^1/252 – 1
+    #   then compute ec(i) = ec(i-1)*(1+dailyReturn(i))
+    
+        if symbol == '^IRX':
+            date_IRX = df.index[0]          # start date for %IRX   
+            dfDatesNew, dfAligned = df_SPY.align(df, join='left', method='ffill') 
+            dfAligned_IRX = dfAligned * 1.0 # The multiply by 1.0 forces the creation of a new array
+    
+            for istart in range(df_SPY.shape[0]):
+                if df_adjClose.index[istart] >= date_IRX: break # Advance to start of data  
+                
+            dfAligned_IRX['Close'].iloc[istart] = 10.0    # start with 1st value= 10.0
+            y_previous = 10.0
+            for i in range(istart+1,df_SPY.shape[0]):
+                x = dfAligned_IRX['Close'].iloc[i]           
+                dr_IRX = (x/100.0)/252.0    # assume 252 trading days in year
+                y = dfAligned_IRX['Close'].iloc[i-1] * (1+dr_IRX)               
+                dfAligned_IRX['Close'].iloc[i] = y 
+                dfAligned_IRX['Open'].iloc[i] = y_previous             
+            df_adjClose = pd.concat([df_adjClose, dfAligned_IRX['Close'].rename('TBILL')], axis = 1)
+     
+    return  (df_adjClose)
+
+#   fx1111M Function
+#       sym_price = current value of symbol
+#       np_EoM  = End-Of_month df for past 12 months
+#       j9   = Multipler for past 1, 3, 6 and 12 months
+#       endMthFlag = if True, then start with end of last month, not today
+def fx1111M(sym_price,np_EoM,j1,j2,j3,j4,endMthFlag):
+    k = 0
+    if endMthFlag == True:
+        k = 1
+    if j4 == 0:             # if no 12 mth value then don't divide by zero
+        if j3 != 0:      
+            jTotal = float(j1+j2+j3)
+            outdf = -1
+            if np_EoM[5+k] > 0.0:
+                outdf = ((j1*((sym_price/np_EoM[0+k])-1.0)) + (j2*((sym_price/np_EoM[2+k])-1.0)) + \
+                (j3*((sym_price/np_EoM[5+k]-1.0)))) / jTotal
+        else:
+            jTotal = float(j1+j2)
+            outdf = -1
+            if np_EoM[2+k] > 0.0:                 
+                outdf = ((j1*((sym_price/np_EoM[0+k])-1.0)) + (j2*((sym_price/np_EoM[2+k])-1.0))) / jTotal         
+    else:
+        jTotal = float(j1+j2+j3+j4)
+        outdf = -1
+        if np_EoM[11+k] > 0.0:                 
+            outdf = ( (j1*((sym_price/np_EoM[0+k])-1.0)) + (j2*((sym_price/np_EoM[2+k])-1.0)) + \
+                (j3*((sym_price/np_EoM[5+k])-1.0)) + (j4*((sym_price/np_EoM[11+k])-1.0))) / jTotal
+    return outdf   
+
+#
+#       **************************************************************************
+#           function_Timer_Fx1111M_timers - Single Symbol
+#               ie. T030 Fx1110M(spy), also T028, T029, T030, T031, T032
+#       Inputs:   df_AdjClose, sym_name, mth1, mth3, mth6, mth12
+#                 sym_name = SPY, VTI, or IWB only
+#                 mthxx can be any value from 0 to 20
+#       Returns:  Panda DataFrame with the timers for every EoM
+#       **************************************************************************
+#
+def function_Timer_Fx1111M(df_AdjClose, sym_name, mth1, mth3, mth6, mth12):
+    if sym_name == 'SPY':
+        start_timer_date = 19930201 + 10000
+    elif sym_name == 'VTI':
+        start_timer_date = 20010601 + 10000
+    elif sym_name == 'IWB':
+        start_timer_date = 20000601 + 10000
+    else:
+        df_Fx1111M = df_AdjClose['SPY'].rename('Timer')
+        df_Fx1111M[0:df_AdjClose.shape[0]] = -1
+        return df_Fx1111M  
+  
+    max_wgt = 20
+    mth_total = mth1 + mth3 + mth6 + mth12
+    if mth1>max_wgt or mth3>max_wgt or mth6>max_wgt or mth12>max_wgt or mth_total == 0:
+        df_Fx1111M = df_AdjClose['SPY'].rename('Timer')
+        df_Fx1111M[0:df_AdjClose.shape[0]] = -1
+        return df_Fx1111M          
+  
+    df_Fx1111M = df_AdjClose[sym_name].rename('Timer') 
+    #   Create Arrays for End-of-Month (eom) Adj. Close Prices for past 12 months
+    np_eom_sym    = np.zeros(14, dtype = float)
+    
+    #       Daily Loop
+    current_month = 0
+    for j in range(df_AdjClose.shape[0]): # Loop for every trading date
+        last_DayOfMth  = False          # Flag if last day of month or end of data
+        last_3DaysOfMth = False         # Flag if in last 3 days of month      
+        if j >= df_AdjClose.shape[0]-3: # if in last 3 days of data, check for a signal
+            last_3DaysOfMth = True
+        if j == df_AdjClose.shape[0]-1: # if at last day of data
+            last_DayOfMth  = True
+        else:  
+            trade_date1 = df_AdjClose.index[j+1]
+            if trade_date1.month != current_month: 
+                current_month = trade_date1.month
+                last_DayOfMth = True
+                last_3DaysOfMth = True
+            else:
+                # Flag if 2nd last day of mth    
+                if j < df_AdjClose.shape[0]-2:
+                    trade_date2 = df_AdjClose.index[j+2]
+                    if trade_date2.month != current_month: 
+                        last_3DaysOfMth = True  
+                # Flag if 3rd last day of mth    
+                if j < df_AdjClose.shape[0]-3:
+                    trade_date3 = df_AdjClose.index[j+3]
+                    if trade_date3.month != current_month: 
+                        last_3DaysOfMth = True
+    
+        # Save Last 12 EoM Closing Prices
+        if last_DayOfMth or j == df_AdjClose.shape[0]-1:   # If last day of month or End-of-Data
+            for jj in range(13,0,-1):          
+                np_eom_sym[jj] = np_eom_sym[jj-1]          
+            np_eom_sym[0] = df_AdjClose[sym_name].iloc[j]  
+      
+        if df_AdjClose['DateKey'].iloc[j] < start_timer_date:
+            df_Fx1111M.iloc[j] = -1.0           # Flag Timer as Not Ready          
+        else:   
+            if last_3DaysOfMth == False:      # If not in last 3 days of month or end of data
+                df_Fx1111M.iloc[j] = df_Fx1111M[j-1] # Repeat current state
+            else:
+                if fx1111M(df_AdjClose[sym_name].iloc[j],np_eom_sym,mth1,mth3,mth6,mth12,last_DayOfMth) >= 0.0:
+                    df_Fx1111M.iloc[j] = 1.0  # Flag as Risk On
+                else:
+                    df_Fx1111M.iloc[j] = 0.0  # Flag as Risk Off               
+    return df_Fx1111M
+
+#
+#       **************************************************************************
+#           function_Timer_Fx1111M_timers_Index_TBILL
+#               ie. T055 Fx1120M(VTI,TBILL)
+#       Inputs:   df_AdjClose, sym_Index, mth1, mth3, mth6, mth12
+#                 sym_Index = SPY, VTI, or IWB only
+#                 mthxx can be any value from 0 to 20
+#       Returns:  Panda DataFrame with the timers for every EoM
+#       **************************************************************************
+#
+def function_Timer_Fx1111M_Index_TBILL(df_AdjClose, sym_Index, mth1, mth3, mth6, mth12):
+    sym_TBILL = 'TBILL'   
+    if sym_Index == 'SPY':
+        start_timer_date = 19930201 + 10000
+    elif sym_Index == 'VTI':
+        start_timer_date = 20010601 + 10000
+    elif sym_Index == 'IWB':
+        start_timer_date = 20000601 + 10000
+    else:
+        df_timer = df_AdjClose['SPY'].rename('Timer')
+        df_timer[0:df_AdjClose.shape[0]] = -1
+        return df_timer
+    max_wgt = 20
+    mth_total = mth1 + mth3 + mth6 + mth12
+    if mth1>max_wgt or mth3>max_wgt or mth6>max_wgt or mth12>max_wgt or mth_total == 0:
+        df_Fx1111M = df_AdjClose['SPY'].rename('Timer')
+        df_Fx1111M[0:df_AdjClose.shape[0]] = -1
+        return df_Fx1111M          
+                
+    df_timer = df_AdjClose[sym_Index].rename('Timer')
+   
+    #   Create Arrays for End-of-Month (eom) Adj. Close Prices for past 12 months
+    np_eom_Index  = np.zeros(14, dtype = float)
+    np_eom_TBILL  = np.zeros(14, dtype = float) 
+    #       Daily Loop
+    current_month = 0
+    for j in range(df_AdjClose.shape[0]): # Loop for every trading date
+        last_DayOfMth  = False          # Flag if last day of month or end of data
+        last_3DaysOfMth = False         # Flag if in last 3 days of month      
+        if j >= df_AdjClose.shape[0]-3: # if in last 3 days of data, check for a signal
+            last_3DaysOfMth = True
+        if j == df_AdjClose.shape[0]-1: # if at last day of data
+            last_DayOfMth  = True
+        else:  
+            trade_date1 = df_AdjClose.index[j+1]
+            if trade_date1.month != current_month: 
+                current_month = trade_date1.month
+                last_DayOfMth = True
+                last_3DaysOfMth = True
+            else:
+                # Flag if 2nd last day of mth    
+                if j < df_AdjClose.shape[0]-2:
+                    trade_date2 = df_AdjClose.index[j+2]
+                    if trade_date2.month != current_month: 
+                        last_3DaysOfMth = True  
+                # Flag if 3rd last day of mth    
+                if j < df_AdjClose.shape[0]-3:
+                    trade_date3 = df_AdjClose.index[j+3]
+                    if trade_date3.month != current_month: 
+                        last_3DaysOfMth = True
+    
+        # Save Last 12 EoM Closing Prices
+        if last_DayOfMth or j == df_AdjClose.shape[0]-1:   # If last day of month or End-of-Data
+            for jj in range(13,0,-1):          
+                np_eom_Index[jj] = np_eom_Index[jj-1]   
+                np_eom_TBILL[jj] = np_eom_TBILL[jj-1]        
+            np_eom_Index[0]   = df_AdjClose[sym_Index].iloc[j]
+            np_eom_TBILL[0] = df_AdjClose[sym_TBILL].iloc[j]     
+        
+        if df_AdjClose['DateKey'].iloc[j] < start_timer_date:
+            df_timer.iloc[j] = -1.0           # Flag Timer as Not Ready
+        else:   
+            if last_3DaysOfMth == False:      # If not in last 3 days of month or end of data
+                df_timer.iloc[j] = df_timer.iloc[j-1] # Repeat current state
+            else:
+                if fx1111M(df_AdjClose[sym_Index].iloc[j],np_eom_Index,mth1,mth3,mth6,mth12,last_DayOfMth) > \
+                   fx1111M(df_AdjClose[sym_TBILL].iloc[j],np_eom_TBILL,mth1,mth3,mth6,mth12,last_DayOfMth):     
+                    df_timer.iloc[j] = 1.0
+                else:
+                    df_timer.iloc[j] = 0.0                
+    return df_timer 
+
+#
+#       **************************************************************************
+#               Fx1111M Function
+#       Inputs:   mth1, mth3, mth6, mth12
+#       Returns:  df_timer
+#       **************************************************************************
+#
+def function_Fx1111M_SPY(df_AdjClose, mth1, mth3, mth6, mth12):    
+    # Call Function to calculate Market Timers
+    df_timer = function_Fx1111M_timers_SPY_TBILL(df_AdjClose, mth1, mth3, mth6, mth12)
+    return (df_timer)
+  
+#
+#       **************************************************************************
+#               function_Timer_EoM_SMA
+#
+#       Averages End-Of-Month (EoM) Close Prices for last 'smaM' months
+#       Therefore, if smaM == 7, it will average the last 7 EoM Closing Prices
+#       Input: 
+#         df_AdjClose DataFrame
+#         sym_name
+#         smaM = # of EoM values to average (7 for S100)
+#       Returns:
+#         np_smaM - Average of last 'smaM' EoM Closing Prices
+# 
+#       **************************************************************************
+# 
+def function_Timer_EoM_SMA(df_AdjClose, sym_name, smaM):
+    max_mths = 20
+    np_EoM  = np.zeros(max_mths, dtype = float)
+    df_Timer = df_AdjClose[sym_name].rename('Timer')
+    df_smaM   = df_AdjClose[sym_name].rename('smaM')
+    df_Timer = pd.concat([df_Timer, df_AdjClose[sym_name], df_smaM], axis = 1)
+     
+    iSize = df_AdjClose.shape[0]    
+    mth_Cntr = 0
+    # 'previous_eom_Average' is used so that on last day of mth, current value is not used
+    eom_mean = 0.0
+    previous_eom_mean = 0.0
+    for i in range(iSize):
+        if df_AdjClose['DayOfMth'].iloc[i] == -1:
+            mth_Cntr += 1           
+            for j in range(1, smaM+1):
+                np_EoM[smaM-j] = np_EoM[smaM-j-1]            
+            np_EoM[0] = df_AdjClose[sym_name].iloc[i]           
+            if mth_Cntr > smaM:
+                eom_mean = 0.0
+                for k in range(smaM):
+                    eom_mean += np_EoM[k]
+                eom_mean /= smaM
+
+        df_Timer['smaM'].iloc[i] = previous_eom_mean
+        df_Timer['Timer'].iloc[i] = -1.0       # default is RiskOff                
+        if previous_eom_mean > 0.0 and df_AdjClose[sym_name].iloc[i] > previous_eom_mean:
+            df_Timer['Timer'].iloc[i] = 1.0    # Set to RiskOn
+        previous_eom_mean = eom_mean         
+    return(df_Timer)
+
+
+#               SMA Function
+#       Input:
+#         df_prices df Series of prices
+#         sma = # of days 
+#       Output:
+#         df_SMA
+#
+def function_SMA(df_prices,days):
+     df_sma= df_prices.rolling(window=days).mean()
+     return df_sma
+
+#
+#       **************************************************************************
+#       function_Timer_smaD(df_AdjClose_Symbols,df_AdjClose_Mutual,sym_name, smaD, sym_source)
+#               ie. T024_smaD210(SPY)
+#                   T053_smaD200(SPY)
+#       Inputs:   df_AdjClose_Symbols
+#                 sym_name = SPY, VTI, or IWB only
+#                 smaD = # of days up to 256 (1 year)
+#       Timer data start dates:
+#           SPY     1/1/1991 (uses $SPX before 1/29/1993)
+#           VTI     4/27/1993 (uses VTSMX before 11/13/2000)
+#           IWB     1/1/1991 Norgate, 12/10/1993 Yahoo (uses $RUI before 5/19/2000)
+#       Returns:  Panda DataFrame with the timer for every Day
+#       **************************************************************************
+#
+def function_Timer_smaD(df_Symbols, sym_name, smaD):
+    iSize = df_Symbols.shape[0]
+    if smaD > 256:              # Maximum of 1 year look-back
+        df_timer = df_Symbols['SPY'].rename('Timer')
+        df_timer[0:iSize] = -1
+        return df_timer
+
+    if sym_name == 'SPY':
+        start_timer_date = 19930129 + 10000  # Valid timer data starts 12 mths after 1/29/1993
+        df_timer = df_Symbols['SPY'].rename('Timer')        
+        df_sma_SPY = df_Symbols['SPY'].rolling(window=smaD).mean()
+    
+        for i in range (iSize):       
+            if df_Symbols['DateKey'].iloc[i] < start_timer_date:
+                df_timer.iloc[i] = -1.0     # Flag Timer as Not Ready
+                continue
+            
+            if df_Symbols['SPY'].iloc[i] >= df_sma_SPY[i]:
+                df_timer.iloc[i] = 1.0    
+            else:
+                df_timer.iloc[i] = 0.0                  
+        return df_timer
+
+    if sym_name == 'VTI':
+        start_timer_date = 20010524 + 10000  # Valid timer data starts 12 mths after 4/27/1992
+        df_timer = df_Symbols['SPY'].rename('Timer')        
+        df_sma_VTI   = df_Symbols['VTI'].rolling(window=smaD).mean()
+    
+        for i in range (iSize):       
+            if df_Symbols['DateKey'].iloc[i] < start_timer_date:
+                df_timer.iloc[i] = -1.0     # Flag Timer as Not Ready
+                continue
+
+            if df_Symbols['VTI'].iloc[i] >= df_sma_VTI[i]:
+                df_timer.iloc[i] = 1.0    
+            else:
+                df_timer.iloc[i] = 0.0                  
+        return df_timer    
+    
+    if sym_name == 'IWB':               # Russell 1000   
+        if sym_source == 'Norgate':
+            start_timer_date = 20000515 + 10000 # Valid timer data starts 12 mths after 12/10/1992
+        df_timer = df_Symbols['SPY'].rename('Timer')        
+    
+        for i in range (iSize):       
+            if df_Symbols['DateKey'].iloc[i] < start_timer_date:
+                df_timer.iloc[i] = -1.0     # Flag Timer as Not Ready
+                continue
+    
+            if df_Symbols['IWB'].iloc[i] >= df_sma_IWB[i]:
+                df_timer.iloc[i] = 1.0    
+            else:
+                df_timer.iloc[i] = 0.0                  
+        return df_timer        
+  
+#
+#       **************************************************************************
+#           function_Timer_smaG(df_AdjClose, sym_name, smaG_first, smaG_last)
+#               ie. T043_smaG(6,9)M(spy)
+#
+#       Inputs:   df_AdjClose
+#                 sym_name = SPY, VTI, or IWB only
+#                 smaG_first = first month (21 days) to average
+#                 smaG_last  = last month (21 days) to average
+#       Returns:  Panda DataFrame with the timers for every Day
+#       **************************************************************************
+#
+def function_Timer_smaG(df_AdjClose, sym_name, g01, g12):
+    if sym_name == 'SPY':
+        start_timer_date = 19930201 + 10000
+    elif sym_name == 'VTI':
+        start_timer_date = 20010601 + 10000
+    elif sym_name == 'IWB':
+        start_timer_date = 20000601 + 10000
+    else:
+        df_timer = df_AdjClose['SPY'].rename('Timer')
+        df_timer[0:df_AdjClose.shape[0]] = -1.0
+        return df_timer  
+    
+    if g01>g12 or g01<=0 or g12>12:
+        df_timer = df_AdjClose['SPY'].rename('Timer')
+        df_timer[0:df_AdjClose.shape[0]] = -1.0
+        return df_timer
+    
+    df_sma1= df_AdjClose[sym_name].rolling(window=1*21).mean()
+    df_sma2= df_AdjClose[sym_name].rolling(window=2*21).mean()
+    df_sma3= df_AdjClose[sym_name].rolling(window=3*21).mean()    
+    df_sma4= df_AdjClose[sym_name].rolling(window=4*21).mean()
+    df_sma5= df_AdjClose[sym_name].rolling(window=5*21).mean()
+    df_sma6= df_AdjClose[sym_name].rolling(window=6*21).mean()
+    df_sma7= df_AdjClose[sym_name].rolling(window=7*21).mean()
+    df_sma8= df_AdjClose[sym_name].rolling(window=8*21).mean()
+    df_sma9= df_AdjClose[sym_name].rolling(window=9*21).mean()
+    
+    df_sma10= df_AdjClose[sym_name].rolling(window=10*21).mean()
+    df_sma11= df_AdjClose[sym_name].rolling(window=11*21).mean()   
+    df_sma12= df_AdjClose[sym_name].rolling(window=12*21).mean() 
+    
+    df_timer = df_AdjClose[sym_name].rename('Timer')  
+    num_mths = g12 - g01 + 1.0
+    for i in range (df_AdjClose.shape[0]):       
+        if df_AdjClose['DateKey'].iloc[i] < start_timer_date:
+            df_timer.iloc[i] = -1.0           # Flag Timer as Not Ready
+            continue
+        spc = df_AdjClose[sym_name].iloc[i]
+        cnt=0        
+        if g01 <= 1 and g12 >= 1:
+            if(spc-df_sma1[i]>0): cnt += 1  
+        if g01 <= 2 and g12 >= 2:
+            if(spc-df_sma2[i]>0): cnt += 1  
+        if g01 <= 3 and g12 >= 3:
+            if(spc-df_sma3[i]>0): cnt += 1  
+        if g01 <= 4 and g12 >= 4:
+            if(spc-df_sma4[i]>0): cnt += 1
+        if g01 <= 5 and g12 >= 5:
+            if(spc-df_sma5[i]>0): cnt += 1  
+        if g01 <= 6 and g12 >= 6:
+            if(spc-df_sma6[i]>0): cnt += 1            
+        if g01 <= 7 and g12 >= 7:            
+            if(spc-df_sma7[i]>0): cnt += 1
+        if g01 <= 8 and g12 >= 8:           
+            if(spc-df_sma8[i]>0): cnt += 1
+        if g01 <= 9 and g12 >= 9:                
+            if(spc-df_sma9[i]>0): cnt += 1
+        if g01 <= 10 and g12 >= 10:                 
+            if(spc-df_sma10[i]>0): cnt += 1        
+        if g01 <= 11 and g12 >= 11:                 
+            if(spc-df_sma11[i]>0): cnt += 1 
+        if g01 <= 12 and g12 >= 12:                 
+            if(spc-df_sma12[i]>0): cnt += 1                         
+        frac_eq = cnt/num_mths   
+        df_timer.iloc[i] = "{:.3f}".format(frac_eq)
+    return df_timer
+
+#
+#       **************************************************************************
+#           function_Timer_smaM(df_AdjClose, sym_name, smaM)
+#               T051_SPY.NoRank.Top1.EW.smaM8(spy)
+#               T052_SPY.NoRank.Top1.EW.smaM6(spy)
+#
+#       Inputs:   df_AdjClose
+#                 sym_name = SPY, VTI, or IWB only
+#                 smaM = # of EoM SMAs (1-12)
+#       Returns:  Panda DataFrame with the timers for every Day
+#       **************************************************************************
+#
+def function_Timer_smaM(df_AdjClose, sym_name, smaM):
+    
+    if sym_name == 'SPY':
+        start_timer_date = 19930201 + 10000
+    elif sym_name == 'VTI':
+        start_timer_date = 20010601 + 10000
+    elif sym_name == 'IWB':
+        start_timer_date = 20000601 + 10000
+    else:
+        df_timer = df_AdjClose['SPY'].rename('Timer')
+        df_timer[0:df_AdjClose.shape[0]] = -1.0
+        return df_timer
+    
+    if smaM <= 0 or smaM > 12:
+        df_timer = df_AdjClose['SPY'].rename('Timer')
+        df_timer[0:df_AdjClose.shape[0]] = -1.0
+        return df_timer    
+    
+#   Create Arrays for End-of-Month (eom) Adj. Close Prices for past 12 months
+    eom_sym = np.zeros(14, dtype = float)
+    
+    sma_eom = 0.0
+    df_timer = df_AdjClose[sym_name].rename('Timer')  
+    for i in range (df_AdjClose.shape[0]): 
+        if df_AdjClose['DayOfMth'].iloc[i] == -1:
+            # Save Last 12 EoM Closing Prices
+            for jj in range(13,0,-1):          
+                eom_sym[jj] = eom_sym[jj-1]        
+            eom_sym[0] = df_AdjClose[sym_name].iloc[i]         
+            i1 = 0                  # ***** Should Really be 1
+            sma_eom = 0.0
+            for m1 in range(i1, smaM+i1):
+                sma_eom += eom_sym[m1]
+            sma_eom /= smaM
+            
+        if df_AdjClose['DateKey'].iloc[i] < start_timer_date: 
+            df_timer[i] = -1.0
+            continue
+            
+        momM_sym = (df_AdjClose[sym_name].iloc[i] / sma_eom) - 1.0           
+        if momM_sym > 0.0:
+            df_timer[i] = 1.00
+        else:
+            df_timer[i] = 0.00   
+    return df_timer                
+
+
+#   fxListM Function
+#       sym_price = current value of symbol
+#       np_EoM  = End-Of_month df for past 12 months
+#       list_mths = list of lookback months, i.e. [1,3,6,12]
+#       list_wgts = list of weights for every look back, i.e. [1,2,2,0]
+#       endMthFlag = if True, then start with end of last month, not today
+def fx1111M_List(sym_price,np_EoM,list_mths,list_wgts,endMthFlag):
+    j1 = list_wgts[0]; j2 = list_wgts[1]; j3 = list_wgts[2]; j4 = list_wgts[3]   
+    m1 = list_mths[0]-1; m2 = list_mths[1]-1; m3 = list_mths[2]-1; m4 = list_mths[3]-1;
+    
+    k = 0
+    if endMthFlag == True:
+        k = 1
+    if j4 == 0:             # if no 12 mth value then don't divide by zero
+        if j3 != 0:      
+            jTotal = float(j1+j2+j3)
+            outdf = -1
+            if np_EoM[m3+k] > 0.0:
+                outdf = ((j1*((sym_price/np_EoM[m1+k])-1.0)) + (j2*((sym_price/np_EoM[m2+k])-1.0)) + \
+                (j3*((sym_price/np_EoM[m3+k]-1.0)))) / jTotal
+        else:
+            jTotal = float(j1+j2)
+            outdf = -1
+            if np_EoM[m2+k] > 0.0:                 
+                outdf = ((j1*((sym_price/np_EoM[m1+k])-1.0)) + (j2*((sym_price/np_EoM[m2+k])-1.0))) / jTotal         
+    else:
+        jTotal = float(j1+j2+j3+j4)
+        outdf = -1
+        if np_EoM[m4+k] > 0.0:                 
+            outdf = ( (j1*((sym_price/np_EoM[m1+k])-1.0)) + (j2*((sym_price/np_EoM[m2+k])-1.0)) + \
+                (j3*((sym_price/np_EoM[m3+k])-1.0)) + (j4*((sym_price/np_EoM[m4+k])-1.0))) / jTotal
+    return outdf   
+
+#
+#       **************************************************************************
+#           function_Timer_Fx1111M_Lists - Single Symbol
+#  
+#       Inputs: df_AdjClose, sym_name, list_mths, list_wgts
+#               sym_name = SPY, VTI, or IWB only
+#               list_mths = list of lookback months, i.e. [1,3,6,12]
+#               list_wgts = list of weights for every look back, i.e. [1,2,2,0]
+#       Returns:  Panda DataFrame with the timers for every EoM
+#       **************************************************************************
+#
+def function_Timer_Fx1111M_Lists(df_AdjClose, sym_name, list_mths, list_wgts):
+    if sym_name == 'SPY':
+        start_timer_date = 19930201 + 10000
+    elif sym_name == 'VTI':
+        start_timer_date = 20010601 + 10000
+    elif sym_name == 'IWB':
+        start_timer_date = 20000601 + 10000
+    else:
+        df_Fx1111M = df_AdjClose['SPY'].rename('Timer')
+        df_Fx1111M[0:df_AdjClose.shape[0]] = -1
+        return df_Fx1111M  
+    
+    #  list of mths and weights must be 4
+    if len(list_mths) != len(list_wgts) or len(list_mths) != 4:
+        df_Fx1111M = df_AdjClose['SPY'].rename('Timer')
+        df_Fx1111M[0:df_AdjClose.shape[0]] = -1
+        return df_Fx1111M  
+    
+    df_Fx1111M = df_AdjClose[sym_name].rename('Timer') 
+    #   Create Arrays for End-of-Month (eom) Adj. Close Prices for past 12 months
+    np_eom_sym    = np.zeros(14, dtype = float)
+    
+    #       Daily Loop
+    current_month = 0
+    for j in range(df_AdjClose.shape[0]): # Loop for every trading date
+        last_DayOfMth  = False          # Flag if last day of month or end of data
+        last_3DaysOfMth = False         # Flag if in last 3 days of month      
+        if j >= df_AdjClose.shape[0]-3: # if in last 3 days of data, check for a signal
+            last_3DaysOfMth = True
+        if j == df_AdjClose.shape[0]-1: # if at last day of data
+            last_DayOfMth  = True
+        else:  
+            trade_date1 = df_AdjClose.index[j+1]
+            if trade_date1.month != current_month: 
+                current_month = trade_date1.month
+                last_DayOfMth = True
+                last_3DaysOfMth = True
+            else:
+                # Flag if 2nd last day of mth    
+                if j < df_AdjClose.shape[0]-2:
+                    trade_date2 = df_AdjClose.index[j+2]
+                    if trade_date2.month != current_month: 
+                        last_3DaysOfMth = True  
+                # Flag if 3rd last day of mth    
+                if j < df_AdjClose.shape[0]-3:
+                    trade_date3 = df_AdjClose.index[j+3]
+                    if trade_date3.month != current_month: 
+                        last_3DaysOfMth = True
+    
+        # Save Last 12 EoM Closing Prices
+        if last_DayOfMth or j == df_AdjClose.shape[0]-1:   # If last day of month or End-of-Data
+            for jj in range(13,0,-1):          
+                np_eom_sym[jj] = np_eom_sym[jj-1]          
+            np_eom_sym[0] = df_AdjClose[sym_name].iloc[j]  
+      
+        if df_AdjClose['DateKey'].iloc[j] < start_timer_date:
+            df_Fx1111M.iloc[j] = -1.0           # Flag Timer as Not Ready          
+        else:   
+            if last_3DaysOfMth == False:      # If not in last 3 days of month or end of data
+                df_Fx1111M.iloc[j] = df_Fx1111M[j-1] # Repeat current state
+            else:
+                if fx1111M_List(df_AdjClose[sym_name].iloc[j],np_eom_sym,list_mths,list_wgts,last_DayOfMth) >= 0.0:
+                    df_Fx1111M.iloc[j] = 1.0  # Flag as Risk On
+                else:
+                    df_Fx1111M.iloc[j] = 0.0  # Flag as Risk Off               
+    return df_Fx1111M
+
+
+
+
+#       *******************************************************************************************
+#
+#       Sample Market Timer Program
+#
+#       Load the Closing Prices from Yahoo
+df_AdjClose_Yahoo = function_load_Yahoo()
+# df_AdjClose_Yahoo.to_excel('c:\\___Python\\Yahoo_AdjClose.xlsx')
+
+#       Load the Closing Prices from Norgate
+df_AdjOpen_Norgate, df_AdjClose_Norgate = function_load_Norgate()
+
+#
+#       **********************************************************************************
+#       FxListM - Back to 1990-01-01 ($SPX, $SPXTR1970 with Norgate)
+#
+#       SPXTR:  B&H 10.98% APR, 0.79 Sharpe, 0.98 Sortino, -55.13% MDD
+#
+#       #56:  Fx0230M(SPY) Days: 13.45% APR, 1.22 Sharpe, 1.75 Sortino, -19,35% MDD, 
+#               41 trades over 31 years
+#               29/32 Up Years
+#
+sym_name = 'SPY'
+wgt1=0; wgt3=0; wgt6=0; wgt12=0;
+k = 0
+iSize = df_AdjClose_Norgate.shape[0]
+
+list_mths = [1,3,6,12]    # #56  (0230) 12.22 1.15 39 trades  
+# list_mths = [1,2,4,6]     # #148 (0112) 11.79% 1.11 Sharpe
+# list_mths = [2,4,6,8]     # #50  (2030) 12.33 1.16 45 trades
+
+for wgt12 in range(0,3): 
+    if k > 192: break
+    for wgt6 in range(0,4):
+        for wgt3 in range(0,4):
+            for wgt1 in range(0,4): 
+                if wgt1+wgt3+wgt6+wgt12 == 0: 
+                    continue
+                list_wgts = [wgt1, wgt3, wgt6, wgt12]
+                
+                k += 1
+                timer = str(10000 + k)
+                df_FX1111M = function_Timer_Fx1111M_Lists(df_AdjClose_Norgate, sym_name, list_mths, list_wgts)   
+                #
+                #   Routine to create an excel file of the Timer - T055 Fx1120M(VTI,TBILL)
+                #
+                f = open('c:\\___Python\\Lloyds_DataSets\\Market_Timers_FX1111M_T' + timer +'.csv', 'w', encoding='UTF8', newline='')
+                writer = csv.writer(f, dialect = 'excel')
+                df_print = pd.DataFrame(columns = ['Date','Timer']) 
+                flag_header = False
+                for i in range(iSize):
+                    if df_AdjClose_Norgate['DayOfMth'].iloc[i] == -1 or i == iSize-1:   # end of mth or end of data?                   
+                        dateEoM  = df_AdjClose_Norgate['DateKey'].iloc[i]           
+                        yr = int(dateEoM / 10000)
+                        mth = int((dateEoM - yr*10000) / 100)
+                        day = int(dateEoM - yr*10000 - mth*100)       
+                              
+                        sym = 'IEF'
+                        if dateEoM < 20020801: sym = 'VFITX'
+                        if df_FX1111M.iloc[i] == 1.0:
+                            sym = 'SPY'
+                            if dateEoM < 19930201: sym = '$SPXTR1970' 
+                            
+                        param = " "
+                        if flag_header == False: 
+                            param = str(wgt1) +'  '+ str(wgt3) +'  '+ str(wgt6) +'  '+ str(wgt12)
+                            flag_header = True
+                        datex = str(mth) +'/'+ str(day) +'/'+ str(yr)
+                        writer.writerow((datex, sym, param))                                            
+                print(timer +'  '+str(wgt1) +'  '+str(wgt3) +'  '+str(wgt6) +'  '+str(wgt12))            
+f.close()
+
+
+

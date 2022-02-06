@@ -1,0 +1,78 @@
+#
+#       AAII_SV_Timer_Examples
+#       Lloyd Mayhew
+#       Jan. 18, 2022   Version 01A
+#
+#       Program can be set up to use either Yahoo or Norgate data.
+#       The program runs much faster using Norgate data because it doesn't have to 
+#       retrieve the data over the Net.
+#
+#       Program can be run during the trading day using Yahoo data. It retrieves the
+#       current Yahoo intraday value. End-of-day only data such as for mutual funds
+#       and ^IRX repeat the previous close when this happens.
+#
+#       Examples:
+#            T028 Fx1111M(SPY), also T030, T031, T032, T058
+#            function_Timer_Fx1111M(df_AdjClose, sym_name, mth01,mth03,mth06,mth12)
+#               - sym_name can be: SPY, VTI, or IWB
+#               - Series contains -1 when not enough data for a Timer signal, 0 = RiskOff, 1 = RiskOn
+#
+#           T055 Fx1120M(VTI,TBILL), also T057
+#           function_Timer_Fx1111M_Index_TBILL(df_AdjClose, sym_Index, mth01,mth03,mth06,mth12)
+#               - sym_name can be: SPY, VTI, or IWB
+#               - Series contains -1 when not enough data for a Timer signal, 0 = RiskOff, 1 = RiskOn
+#
+#       Versions:
+#
+import AAII_SV_Timer_Library as sv
+
+import numpy as np
+import pandas as pd
+import pandas_datareader as pdr
+import matplotlib.pyplot as plt
+import math
+import datetime as dt
+from   datetime import datetime
+from   datetime import timedelta
+import pytz
+  
+#
+#       Sample Market Timer Program
+#
+#       Load the Closing Prices from Yahoo
+df_AdjClose = sv.function_load_Yahoo()
+
+#       Load the Closing Prices from Norgate
+#import norgatedata
+#df_AdjOpen, df_AdjClose = sv.function_load_Norgate()
+
+#       T028 Fx1111M(spy)
+sym_SPY = 'SPY'
+mth01=1; mth03=1; mth06=1; mth12=1
+df_Fx1111M_SPY = sv.function_Timer_Fx1111M(df_AdjClose, sym_SPY, mth01,mth03,mth06,mth12)
+
+#       T030 Fx1110M(spy)
+sym_SPY = 'SPY'
+mth01=1; mth03=1; mth06=1; mth12=0
+df_Fx1110M_SPY = sv.function_Timer_Fx1111M(df_AdjClose, sym_SPY, mth01,mth03,mth06,mth12)
+
+#       T055 Fx1120M(VTI,TBILL)
+sym_Index = 'VTI'
+mth01=1; mth03=1; mth06=2; mth12=0
+df_Fx1111M_Index_TBILL = sv.function_Timer_Fx1111M_Index_TBILL(df_AdjClose, sym_Index, mth01,mth03,mth06,mth12)
+
+#       T057 Fx1120M(IWB,TBILL)
+sym_Index = 'IWB'
+mth01=1; mth03=1; mth06=2; mth12=0
+df_Fx1111M_IWB_TBILL = sv.function_Timer_Fx1111M_Index_TBILL(df_AdjClose, sym_Index, mth01,mth03,mth06,mth12)
+
+#   Routine to create an excel file of the Timer - T055 Fx1120M(VTI,TBILL)
+#
+df_Fx1111M_Index_EoM = pd.DataFrame(columns = ['Date','Timer'])   
+for i in range(df_AdjClose.shape[0]):
+    if df_AdjClose['DayOfMth'].iloc[i] == -1:
+        dateEoM  = df_AdjClose['DateKey'].iloc[i]
+        timerEoM = df_Fx1111M_Index_TBILL.iloc[i]
+        df_Fx1111M_Index_EoM = df_Fx1111M_Index_EoM.append({'Date': dateEoM, 'Timer': timerEoM}, ignore_index=True)
+df_Fx1111M_Index_EoM.to_excel('c:\\___Python\\Timer_Fx1111M_VTI_TBILL.xlsx')
+
